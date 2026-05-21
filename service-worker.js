@@ -1,39 +1,39 @@
 /* ══════════════════════════════════════════════════════
    PickStar — Service Worker
-   Version : 2026-05-20 | PickStar v2.0 (Modular)
+   Version : 2026-05-21 | PickStar v2.1 (Modular)
    Strategy: Cache-first for app shell, Network-first for API
    ══════════════════════════════════════════════════════
 
-   v2.0 변경사항:
-   - 단일 index.html → 모듈 분리 구조에 맞게 APP_SHELL 업데이트
-   - css/styles.css + js/*.js 11개 파일 캐시 추가
+   v2.1 변경사항:
+   - start_url "/" 에 맞게 APP_SHELL 루트("/") 캐시 추가
+   - Firebase CDN 네트워크 우선 전략 추가
    ══════════════════════════════════════════════════════ */
 
-var CACHE_NAME = 'pickstar-2026-05-20';
+var CACHE_NAME = 'pickstar-2026-05-21';
 
 /* App shell files — cached on install, served offline */
 var APP_SHELL = [
-    './',
-    './index.html',
-    './manifest.json',
-    './icon-192.png',
-    './icon-512.png',
+    '/',
+    '/index.html',
+    '/manifest.json',
+    '/icon-192.png',
+    '/icon-512.png',
 
     /* CSS */
-    './css/styles.css',
+    '/css/styles.css',
 
-    /* JS modules — load order matters for reference only; SW caches all */
-    './js/firebase-init.js',
-    './js/time-helpers.js',
-    './js/storage.js',
-    './js/api.js',
-    './js/games.js',
-    './js/render.js',
-    './js/saved.js',
-    './js/quick-gen.js',
-    './js/navigation.js',
-    './js/star-animation.js',
-    './js/main.js'
+    /* JS modules */
+    '/js/firebase-init.js',
+    '/js/time-helpers.js',
+    '/js/storage.js',
+    '/js/api.js',
+    '/js/games.js',
+    '/js/render.js',
+    '/js/saved.js',
+    '/js/quick-gen.js',
+    '/js/navigation.js',
+    '/js/star-animation.js',
+    '/js/main.js'
 ];
 
 /* ── INSTALL: cache the app shell ── */
@@ -44,7 +44,6 @@ self.addEventListener('install', function(e) {
             console.log('[SW] Caching app shell');
             return cache.addAll(APP_SHELL);
         }).then(function() {
-            /* Skip waiting so the new SW activates immediately */
             return self.skipWaiting();
         })
     );
@@ -58,7 +57,6 @@ self.addEventListener('activate', function(e) {
             return Promise.all(
                 keys
                     .filter(function(key) {
-                        /* Delete any pickstar cache that is NOT the current version */
                         return key !== CACHE_NAME && key.indexOf('pickstar') === 0;
                     })
                     .map(function(key) {
@@ -67,7 +65,6 @@ self.addEventListener('activate', function(e) {
                     })
             );
         }).then(function() {
-            /* Take control of all open tabs immediately */
             return self.clients.claim();
         })
     );
@@ -77,11 +74,10 @@ self.addEventListener('activate', function(e) {
 self.addEventListener('fetch', function(e) {
     var url = e.request.url;
 
-    /* Always go to network for API calls (data.ny.gov) — never cache live data */
+    /* API 호출 — 항상 네트워크 (data.ny.gov) */
     if (url.indexOf('data.ny.gov') !== -1) {
         e.respondWith(
             fetch(e.request).catch(function() {
-                /* Offline and no cache for API — return empty JSON array */
                 return new Response('[]', {
                     headers: { 'Content-Type': 'application/json' }
                 });
@@ -90,7 +86,7 @@ self.addEventListener('fetch', function(e) {
         return;
     }
 
-    /* Always go to network for Firebase (Firestore) */
+    /* Firebase Firestore — 항상 네트워크 */
     if (url.indexOf('firestore.googleapis.com') !== -1 ||
         url.indexOf('firebase.googleapis.com') !== -1) {
         e.respondWith(
@@ -103,7 +99,7 @@ self.addEventListener('fetch', function(e) {
         return;
     }
 
-    /* Always go to network for Google Fonts (CDN) */
+    /* Google Fonts — 항상 네트워크 */
     if (url.indexOf('fonts.googleapis.com') !== -1 ||
         url.indexOf('fonts.gstatic.com') !== -1) {
         e.respondWith(fetch(e.request).catch(function() {
@@ -112,7 +108,7 @@ self.addEventListener('fetch', function(e) {
         return;
     }
 
-    /* Firebase SDK CDN — network first, cache fallback */
+    /* Firebase SDK CDN — 네트워크 우선, 캐시 fallback */
     if (url.indexOf('gstatic.com/firebasejs') !== -1) {
         e.respondWith(
             fetch(e.request).then(function(response) {
@@ -128,15 +124,13 @@ self.addEventListener('fetch', function(e) {
         return;
     }
 
-    /* App shell: Cache-first strategy */
+    /* App shell — 캐시 우선 */
     e.respondWith(
         caches.match(e.request).then(function(cached) {
             if (cached) {
                 return cached;
             }
-            /* Not in cache — fetch from network and cache the response */
             return fetch(e.request).then(function(response) {
-                /* Only cache valid same-origin responses */
                 if (!response || response.status !== 200 || response.type !== 'basic') {
                     return response;
                 }
@@ -146,7 +140,6 @@ self.addEventListener('fetch', function(e) {
                 });
                 return response;
             }).catch(function() {
-                /* Offline and not cached — nothing we can do */
                 return new Response('Offline — please reload when connected.', {
                     status: 503,
                     headers: { 'Content-Type': 'text/plain' }
