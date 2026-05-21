@@ -1,23 +1,39 @@
 /* ══════════════════════════════════════════════════════
    PickStar — Service Worker
-   Version : 2026-04-27 | PickStar
+   Version : 2026-05-20 | PickStar v2.0 (Modular)
    Strategy: Cache-first for app shell, Network-first for API
    ══════════════════════════════════════════════════════
 
-   [Phase 1.2] Date-based cache name.
-   When you push an update, change CACHE_NAME to today's date.
-   The activate event will automatically delete all old caches.
+   v2.0 변경사항:
+   - 단일 index.html → 모듈 분리 구조에 맞게 APP_SHELL 업데이트
+   - css/styles.css + js/*.js 11개 파일 캐시 추가
    ══════════════════════════════════════════════════════ */
 
-var CACHE_NAME = 'pickstar-2026-04-27';
+var CACHE_NAME = 'pickstar-2026-05-20';
 
 /* App shell files — cached on install, served offline */
 var APP_SHELL = [
     './',
-    './ny_lottery_generator.html',
+    './index.html',
     './manifest.json',
     './icon-192.png',
-    './icon-512.png'
+    './icon-512.png',
+
+    /* CSS */
+    './css/styles.css',
+
+    /* JS modules — load order matters for reference only; SW caches all */
+    './js/firebase-init.js',
+    './js/time-helpers.js',
+    './js/storage.js',
+    './js/api.js',
+    './js/games.js',
+    './js/render.js',
+    './js/saved.js',
+    './js/quick-gen.js',
+    './js/navigation.js',
+    './js/star-animation.js',
+    './js/main.js'
 ];
 
 /* ── INSTALL: cache the app shell ── */
@@ -74,12 +90,41 @@ self.addEventListener('fetch', function(e) {
         return;
     }
 
+    /* Always go to network for Firebase (Firestore) */
+    if (url.indexOf('firestore.googleapis.com') !== -1 ||
+        url.indexOf('firebase.googleapis.com') !== -1) {
+        e.respondWith(
+            fetch(e.request).catch(function() {
+                return new Response('{}', {
+                    headers: { 'Content-Type': 'application/json' }
+                });
+            })
+        );
+        return;
+    }
+
     /* Always go to network for Google Fonts (CDN) */
     if (url.indexOf('fonts.googleapis.com') !== -1 ||
         url.indexOf('fonts.gstatic.com') !== -1) {
         e.respondWith(fetch(e.request).catch(function() {
             return new Response('', { status: 503 });
         }));
+        return;
+    }
+
+    /* Firebase SDK CDN — network first, cache fallback */
+    if (url.indexOf('gstatic.com/firebasejs') !== -1) {
+        e.respondWith(
+            fetch(e.request).then(function(response) {
+                var clone = response.clone();
+                caches.open(CACHE_NAME).then(function(cache) {
+                    cache.put(e.request, clone);
+                });
+                return response;
+            }).catch(function() {
+                return caches.match(e.request);
+            })
+        );
         return;
     }
 
