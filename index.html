@@ -2072,4 +2072,1879 @@ function saveToFirestore(collection, gameId, data) {
     if (!_firestore) return;
     try {
         data.updatedAt = new Date().toISOString();
-   
+        _firestore.collection(collection).doc(gameId).set(data)
+            .then(function() {
+                console.log('[Firebase] Firestore SAVE:', collection, gameId);
+            })
+            .catch(function(e) {
+                console.log('[Firebase] Firestore 저장 오류:', e.message);
+            });
+    } catch(e) {}
+}
+
+/* ══ [Phase 1.1] ET TIME ZONE HELPER ══
+   Always compute Eastern Time regardless of user's device timezone.
+   Handles both EST (UTC-5) and EDT (UTC-4) automatically via DST detection. */
+function getETTime() {
+    var now = new Date();
+    var utcMs = now.getTime() + (now.getTimezoneOffset() * 60000);
+    /* DST detection: if current offset is less than the max offset (winter), it's DST */
+    var jan = new Date(now.getFullYear(), 0, 1);
+    var jul = new Date(now.getFullYear(), 6, 1);
+    var stdOffset = Math.max(jan.getTimezoneOffset(), jul.getTimezoneOffset());
+    var isDST = now.getTimezoneOffset() < stdOffset;
+    var etOffsetMs = isDST ? (-4 * 3600000) : (-5 * 3600000); /* EDT = -4, EST = -5 */
+    return new Date(utcMs + etOffsetMs);
+}
+
+/* ══ DRAW SCHEDULE ══ */
+var GAMES = {
+    powerball:   { days:[1,3,6], hour:22, min:59 },
+    mega:        { days:[2,5],   hour:23, min:0  },
+    lotto:       { days:[3,6],   hour:23, min:21 },
+    millionaire: { days:[1,4],   hour:21, min:0  },
+    quickdraw:   { days:[0,1,2,3,4,5,6], hour:2,  min:0  },
+    take5:       { days:[0,1,2,3,4,5,6], hour:22, min:30 },
+    pick10:      { days:[0,1,2,3,4,5,6], hour:22, min:30 },
+    win4:        { days:[0,1,2,3,4,5,6], hour:22, min:30 },
+    numbers:     { days:[0,1,2,3,4,5,6], hour:22, min:30 }
+};
+var DAY_FULL = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+
+/* [Phase 1.1] getNextDraw now uses ET time instead of local device time */
+function getNextDraw(gameId) {
+    var g = GAMES[gameId]; if (!g) return '';
+    var now = getETTime(); /* FIX: was new Date() — used device local time */
+    var dow = now.getDay();
+    var h = now.getHours(), m = now.getMinutes();
+    if (gameId === 'quickdraw') {
+        var active = (h >= 4) && !(h === 2 && m > 0) && h < 26; /* 4AM-2AM ET window */
+        if (active) return 'Next draw in ~' + (4 - (m % 4)) + ' min ET';
+        return 'Opens at 4:00 AM ET';
+    }
+    for (var offset = 0; offset <= 7; offset++) {
+        var checkDay = (dow + offset) % 7;
+        for (var di = 0; di < g.days.length; di++) {
+            if (g.days[di] === checkDay) {
+                if (offset === 0 && (h > g.hour || (h === g.hour && m >= g.min))) continue;
+                var label = offset === 0 ? 'Today' : (offset === 1 ? 'Tomorrow' : DAY_FULL[checkDay]);
+                var hh = g.hour > 12 ? g.hour - 12 : (g.hour === 0 ? 12 : g.hour);
+                var ap = g.hour >= 12 ? 'PM' : 'AM';
+                var mm = g.min < 10 ? '0' + g.min : '' + g.min;
+                return 'Next: ' + label + '\n@ ' + hh + ':' + mm + ' ' + ap + ' ET';
+            }
+        }
+    }
+    return '';
+}
+
+function updateNextDraws() {
+    var ids = ['powerball','mega','lotto','millionaire','quickdraw','take5','pick10','win4','numbers'];
+    for (var i = 0; i < ids.length; i++) {
+        /* update game screen next-draw label */
+        var el = document.getElementById(ids[i] + '-next');
+        if (el) el.textContent = getNextDraw(ids[i]);
+        /* update home screen tile next-draw label */
+        var hel = document.getElementById('home-' + ids[i] + '-next');
+        if (hel) hel.textContent = getNextDraw(ids[i]);
+    }
+}
+
+/* ══ [Phase 1.1] LIVE CLOCK — shows ET time ══ */
+function updateClock() {
+    var et = getETTime(); /* FIX: was new Date() — used device local time */
+    var h = et.getHours(), m = et.getMinutes(), s = et.getSeconds();
+    var ampm = h >= 12 ? 'PM' : 'AM';
+    var h12 = h % 12 || 12;
+    function pad(n) { return n < 10 ? '0' + n : '' + n; }
+    var el = document.getElementById('live-time');
+    var del = document.getElementById('live-date');
+    if (el) el.textContent = h12 + ':' + pad(m) + ':' + pad(s) + ' ' + ampm + ' ET';
+    if (del) del.textContent = (et.getMonth()+1) + '/' + et.getDate() + '/' + et.getFullYear();
+}
+
+/* ══ WINNING NUMBERS API ══
+   Sources: data.ny.gov SODA API (all free, no auth required)
+   POWERBALL  (d6yy-54nr): "Winning Numbers" = "n1 n2 n3 n4 n5 pb"
+   MEGA       (5xaw-6ayf): "Winning Numbers" = 5 main, "Mega Ball" separate
+   NY LOTTO   (6nbc-h7bj): "Winning Numbers" = 6 main, "Bonus #" separate
+   MILLIONAIRE(a4w9-a3tp): auto-scan for bonus ball in 1-5 range
+   QUICK DRAW (7sqk-ycpk): "Winning Numbers" = space-separated 10 numbers
+   TAKE 5     (dg63-4siq): "Evening Winning Numbers" / "Midday Winning Numbers"
+   PICK 10    (bycu-cw7c): "Winning Numbers" — space-separated
+   WIN 4      (hj4u-8nyt): auto-scan for 4-digit string
+   NUMBERS    (hsys-3def): auto-scan for 3-digit string
+══ */
+var API_CFG = {
+    powerball: {
+        url: 'https://data.ny.gov/resource/d6yy-54nr.json?$limit=1&$order=draw_date+DESC',
+        parse: function(r) {
+            var raw = r.winning_numbers ? r.winning_numbers.trim() : '';
+            var tokens = raw.split(' ');
+            var balls = [];
+            for (var i = 0; i < tokens.length - 1; i++) {
+                if (tokens[i].trim()) balls.push({ n: parseInt(tokens[i], 10), bonus: false });
+            }
+            var pb = tokens[tokens.length - 1];
+            if (pb && pb.trim()) balls.push({ n: parseInt(pb, 10), bonus: true });
+            return { balls: balls, bonusClass: 'ball-w-bonus', date: r.draw_date };
+        }
+    },
+    mega: {
+        url: 'https://data.ny.gov/resource/5xaw-6ayf.json?$limit=1&$order=draw_date+DESC',
+        parse: function(r) {
+            var raw = r.winning_numbers ? r.winning_numbers.trim() : '';
+            var tokens = raw.split(' ');
+            var balls = [];
+            for (var i = 0; i < tokens.length; i++) {
+                if (tokens[i].trim()) balls.push({ n: parseInt(tokens[i], 10), bonus: false });
+            }
+            var mb = r.mega_ball || r.megaball || '';
+            if (mb) balls.push({ n: parseInt(mb, 10), bonus: true });
+            return { balls: balls, bonusClass: 'ball-w-bonus-gold', date: r.draw_date };
+        }
+    },
+    lotto: {
+        url: 'https://data.ny.gov/resource/6nbc-h7bj.json?$limit=1&$order=draw_date+DESC',
+        parse: function(r) {
+            var raw = r.winning_numbers ? r.winning_numbers.trim() : '';
+            var tokens = raw.split(' ');
+            var balls = [];
+            for (var i = 0; i < tokens.length; i++) {
+                if (tokens[i].trim()) balls.push({ n: parseInt(tokens[i], 10), bonus: false });
+            }
+            var bn = r['bonus_'] || r.bonus || r['bonus_number'] || '';
+            if (bn) balls.push({ n: parseInt(bn, 10), bonus: true });
+            return { balls: balls, bonusClass: 'ball-w-bonus-green', date: r.draw_date };
+        }
+    },
+    millionaire: {
+        url: 'https://data.ny.gov/resource/a4w9-a3tp.json?$limit=1&$order=draw_date+DESC',
+        parse: function(r) {
+            var raw = r.winning_numbers ? r.winning_numbers.trim() : '';
+            var tokens = raw.split(' ');
+            var balls = [];
+            for (var i = 0; i < tokens.length; i++) {
+                var t = tokens[i].trim();
+                if (t) balls.push({ n: parseInt(t, 10), bonus: false });
+            }
+            var mbRaw = r.millionaire_ball   || r.millionaire_ball_
+                     || r.millionaire_ball_number
+                     || r.life_ball          || r.life_ball_
+                     || r.mega_ball          || r.mega_ball_
+                     || r.bonus_ball         || r.bonus_ball_
+                     || r.bonus_             || r.bonus
+                     || r.multiplier         || r.powerball
+                     || '';
+            if (!mbRaw) {
+                var keys = Object.keys(r);
+                for (var k = 0; k < keys.length; k++) {
+                    var key = keys[k];
+                    if (key === 'draw_date' || key === 'winning_numbers' || key.charAt(0) === ':') continue;
+                    var candidate = parseInt(r[key], 10);
+                    if (!isNaN(candidate) && candidate >= 1 && candidate <= 5) { mbRaw = r[key]; break; }
+                }
+            }
+            if (mbRaw) balls.push({ n: parseInt(mbRaw, 10), bonus: true });
+            return { balls: balls, bonusClass: 'ball-w-bonus-gold', date: r.draw_date };
+        }
+    },
+    quickdraw: {
+        url: 'https://data.ny.gov/resource/7sqk-ycpk.json?$limit=1&$order=draw_date+DESC',
+        parse: function(r) {
+            var raw = r.winning_numbers ? r.winning_numbers.trim() : '';
+            var tokens = raw.split(' ');
+            var balls = [];
+            for (var i = 0; i < tokens.length; i++) {
+                if (tokens[i].trim()) balls.push({ n: parseInt(tokens[i], 10), bonus: false });
+            }
+            return { balls: balls, bonusClass: '', date: r.draw_date };
+        }
+    },
+    take5: {
+        url: 'https://data.ny.gov/resource/dg63-4siq.json?$limit=1&$order=draw_date+DESC',
+        parse: function(r) {
+            var raw = r.evening_winning_numbers || r.midday_winning_numbers || '';
+            raw = raw.trim();
+            var tokens = raw.split(' ');
+            var balls = [];
+            for (var i = 0; i < tokens.length; i++) {
+                var t = tokens[i].trim();
+                if (t) balls.push({ n: parseInt(t, 10), bonus: false });
+            }
+            return { balls: balls, bonusClass: '', date: r.draw_date };
+        }
+    },
+    pick10: {
+        url: 'https://data.ny.gov/resource/bycu-cw7c.json?$limit=1&$order=draw_date+DESC',
+        parse: function(r) {
+            var raw = r.winning_numbers ? r.winning_numbers.trim() : '';
+            var tokens = raw.split(' ');
+            var balls = [];
+            for (var i = 0; i < tokens.length; i++) {
+                if (tokens[i].trim()) balls.push({ n: parseInt(tokens[i], 10), bonus: false });
+            }
+            return { balls: balls, bonusClass: '', date: r.draw_date };
+        }
+    },
+    win4: {
+        url: 'https://data.ny.gov/resource/hj4u-8nyt.json?$limit=1&$order=draw_date+DESC',
+        parse: function(r) {
+            var eveningRaw = r.evening_win_4_ || r.evening_win_4 || r.evening_win_4_number || '';
+            var middayRaw  = r.midday_win_4_  || r.midday_win_4 || r.midday_win_4_number  || '';
+            if (!eveningRaw || !middayRaw) {
+                var keys = Object.keys(r);
+                for (var k = 0; k < keys.length; k++) {
+                    var key = keys[k];
+                    if (key === 'draw_date' || key.charAt(0) === ':') continue;
+                    var val = (r[key] || '').toString().replace(/\s/g, '');
+                    if (/^\d{3,4}$/.test(val)) {
+                        if (!eveningRaw && key.indexOf('evening') !== -1) eveningRaw = val;
+                        else if (!middayRaw && key.indexOf('midday') !== -1) middayRaw = val;
+                        else if (!eveningRaw) eveningRaw = val;
+                    }
+                }
+            }
+            var raw = (eveningRaw || middayRaw || '').toString().replace(/\s/g, '');
+            var balls = [];
+            for (var i = 0; i < raw.length; i++) { balls.push({ n: raw[i], bonus: false, zero: true }); }
+            return { balls: balls, bonusClass: '', date: r.draw_date };
+        }
+    },
+    numbers: {
+        url: 'https://data.ny.gov/resource/hsys-3def.json?$limit=1&$order=draw_date+DESC',
+        parse: function(r) {
+            var eveningRaw = r.evening_daily_ || r.evening_daily || r.evening_numbers_winning_numbers || '';
+            var middayRaw  = r.midday_daily_  || r.midday_daily  || r.midday_numbers_winning_numbers  || '';
+            if (!eveningRaw || !middayRaw) {
+                var keys = Object.keys(r);
+                for (var k = 0; k < keys.length; k++) {
+                    var key = keys[k];
+                    if (key === 'draw_date' || key.charAt(0) === ':') continue;
+                    if (key.indexOf('win') !== -1) continue;
+                    var val = (r[key] || '').toString().replace(/\s/g, '');
+                    if (/^\d{3}$/.test(val)) {
+                        if (!eveningRaw && key.indexOf('evening') !== -1) eveningRaw = val;
+                        else if (!middayRaw && key.indexOf('midday') !== -1) middayRaw = val;
+                        else if (!eveningRaw) eveningRaw = val;
+                    }
+                }
+            }
+            var raw = (eveningRaw || middayRaw || '').toString().replace(/\s/g, '');
+            var balls = [];
+            for (var i = 0; i < raw.length; i++) { balls.push({ n: raw[i], bonus: false, zero: true }); }
+            return { balls: balls, bonusClass: '', date: r.draw_date };
+        }
+    }
+};
+
+function formatDrawDate(iso) {
+    if (!iso) return '';
+    var d = new Date(iso);
+    var months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    return months[d.getMonth()] + ' ' + d.getDate() + ', ' + d.getFullYear();
+}
+
+function renderWinningBalls(gameId, balls, bonusClass) {
+    var container = document.getElementById(gameId + '-winning-balls');
+    if (!container) return;
+    var row = document.createElement('div');
+    row.className = 'winning-balls';
+    var addedSep = false;
+    for (var i = 0; i < balls.length; i++) {
+        var item = balls[i];
+        if (item.bonus && !addedSep) {
+            var sep = document.createElement('div');
+            sep.className = 'ball-sep'; sep.textContent = '+';
+            row.appendChild(sep); addedSep = true;
+        }
+        var ball = document.createElement('div');
+        var wClass = 'ball-w ';
+        if (item.bonus)     wClass += bonusClass;
+        else if (item.zero) wClass += 'ball-w-zero';
+        else                wClass += 'ball-w-main';
+        ball.className = wClass;
+        ball.textContent = item.n;
+        row.appendChild(ball);
+    }
+    container.innerHTML = '';
+    container.appendChild(row);
+}
+
+function makeOfficialSiteHTML(url, label) {
+    return '<a href="' + url + '" target="_blank" rel="noopener" '
+         + 'style="display:inline-flex;align-items:center;gap:8px;'
+         + 'background:var(--surface2);border:1px solid var(--border);'
+         + 'border-radius:8px;padding:10px 14px;color:var(--gold);'
+         + 'font-size:13px;font-weight:600;text-decoration:none;'
+         + 'transition:border-color 0.2s;" '
+         + 'onmouseover="this.style.borderColor=\'rgba(212,168,67,0.5)\'" '
+         + 'onmouseout="this.style.borderColor=\'var(--border)\'">'
+         + '<span style="font-size:15px">&#x1F517;</span>'
+         + 'View ' + label + ' at nylottery.ny.gov'
+         + '<span style="font-size:11px;opacity:0.6">&#x2197;</span>'
+         + '</a>';
+}
+
+/* ══ 핫/콜드 번호 캐시 (생성 구슬 색상용) ══ */
+var hotNumCache  = {};  /* { gameId: [n1,n2,...] } */
+var coldNumCache = {};  /* { gameId: [n1,n2,...] } */
+
+function storeHotColdCache(gameId, freq, topN) {
+    var arr = [];
+    var keys = Object.keys(freq);
+    for (var i = 0; i < keys.length; i++) {
+        arr.push({ n: parseInt(keys[i], 10), count: freq[keys[i]] });
+    }
+    /* 핫: 빈도 높은 순 */
+    arr.sort(function(a, b) { return b.count - a.count || a.n - b.n; });
+    hotNumCache[gameId]  = arr.slice(0, topN).map(function(x){ return x.n; });
+    /* 콜드: 빈도 낮은 순 */
+    arr.sort(function(a, b) { return a.count - b.count || a.n - b.n; });
+    coldNumCache[gameId] = arr.slice(0, topN).map(function(x){ return x.n; });
+}
+
+function getBallType(gameId, number) {
+    var hot  = hotNumCache[gameId]  || [];
+    var cold = coldNumCache[gameId] || [];
+    var num = parseInt(number, 10);
+    if (hot.indexOf(num)  !== -1) return 'hot';
+    if (cold.indexOf(num) !== -1) return 'cold';
+    return 'normal';
+}
+
+/* ══ [Phase 1.5] winningCache with TTL (6-hour expiration) ══ */
+var winningCache = {};  /* { gameId: { balls:[], timestamp:ms, ttl:ms } } */
+
+function cacheWinning(gameId, balls) {
+    winningCache[gameId] = {
+        balls: balls,
+        timestamp: Date.now(),
+        ttl: 6 * 3600000  /* 6 hours */
+    };
+}
+
+function getCachedWinning(gameId) {
+    var cached = winningCache[gameId];
+    if (!cached) return null;
+    if (Date.now() - cached.timestamp > cached.ttl) {
+        delete winningCache[gameId];  /* expire stale entry */
+        return null;
+    }
+    return cached.balls;
+}
+
+function fetchWinningNumbers(gameId) {
+    var cfg = API_CFG[gameId];
+    if (!cfg) return;
+    var ballsEl = document.getElementById(gameId + '-winning-balls');
+    var dateEl  = document.getElementById(gameId + '-winning-date');
+
+    if (cfg.useOfficialSite) {
+        if (dateEl) dateEl.textContent = '';
+        if (ballsEl) ballsEl.innerHTML = makeOfficialSiteHTML(cfg.officialUrl, cfg.officialLabel);
+        return;
+    }
+
+    /* 우선순위 1: localStorage 캐시 */
+    var cached = loadDailyCache(gameId, 'winning');
+    if (cached && cached.balls) {
+        if (dateEl) dateEl.textContent = cached.date || '';
+        renderWinningBalls(gameId, cached.balls, cached.bonusClass);
+        cacheWinning(gameId, cached.balls);
+        console.log('[Cache] winning localStorage HIT:', gameId);
+        return;
+    }
+
+    if (ballsEl) ballsEl.innerHTML = '<div class="winning-loading"><span class="spin"></span>Loading...</div>';
+
+    /* 우선순위 2: Firestore */
+    fetchFromFirestore('lottery', gameId, function(fsData) {
+        if (fsData && fsData.balls && fsData.balls.length > 0) {
+            var dateStr = fsData.date || '';
+            if (dateEl) dateEl.textContent = dateStr;
+            renderWinningBalls(gameId, fsData.balls, fsData.bonusClass || '');
+            cacheWinning(gameId, fsData.balls);
+            saveDailyCache(gameId, 'winning', {
+                balls: fsData.balls,
+                bonusClass: fsData.bonusClass || '',
+                date: dateStr
+            });
+            console.log('[Firebase] winning Firestore HIT:', gameId);
+            return;
+        }
+
+        /* 우선순위 3: data.ny.gov 직접 API (fallback) */
+        fetch(cfg.url)
+            .then(function(resp) { return resp.json(); })
+            .then(function(data) {
+                if (!data || data.length === 0) {
+                    if (ballsEl) ballsEl.innerHTML = '<div class="winning-error">No data available</div>';
+                    return;
+                }
+                var parsed = cfg.parse(data[0]);
+                var dateStr = formatDrawDate(parsed.date);
+                if (dateEl) dateEl.textContent = dateStr;
+                renderWinningBalls(gameId, parsed.balls, parsed.bonusClass);
+                cacheWinning(gameId, parsed.balls);
+                /* localStorage 저장 */
+                saveDailyCache(gameId, 'winning', {
+                    balls: parsed.balls,
+                    bonusClass: parsed.bonusClass,
+                    date: dateStr
+                });
+                /* Firestore 저장 (다음 사용자를 위해) */
+                saveToFirestore('lottery', gameId, {
+                    balls: parsed.balls,
+                    bonusClass: parsed.bonusClass,
+                    date: dateStr
+                });
+                console.log('[API] winning API fallback SAVE:', gameId);
+            })
+            .catch(function() {
+                if (ballsEl) ballsEl.innerHTML = '<div class="winning-error">Could not load — check nylottery.ny.gov</div>';
+            });
+    });
+}
+
+var fetchedGames = {};
+var fetchedHot   = {};
+
+/* ══ HOT NUMBERS CONFIG ══ */
+var HOT_CFG = {
+    powerball: {
+        url: 'https://data.ny.gov/resource/d6yy-54nr.json?$limit=100&$order=draw_date+DESC',
+        extract: function(r) {
+            var raw = r.winning_numbers ? r.winning_numbers.trim() : '';
+            var tokens = raw.split(' ');
+            var nums = [];
+            for (var i = 0; i < tokens.length - 1; i++) {
+                var n = parseInt(tokens[i], 10); if (!isNaN(n)) nums.push(n);
+            }
+            return nums;
+        },
+        top: 5, isDigit: false
+    },
+    mega: {
+        url: 'https://data.ny.gov/resource/5xaw-6ayf.json?$limit=100&$order=draw_date+DESC',
+        extract: function(r) {
+            var raw = r.winning_numbers ? r.winning_numbers.trim() : '';
+            var tokens = raw.split(' ');
+            var nums = [];
+            for (var i = 0; i < tokens.length; i++) {
+                var n = parseInt(tokens[i], 10); if (!isNaN(n)) nums.push(n);
+            }
+            return nums;
+        },
+        top: 5, isDigit: false
+    },
+    lotto: {
+        url: 'https://data.ny.gov/resource/6nbc-h7bj.json?$limit=100&$order=draw_date+DESC',
+        extract: function(r) {
+            var raw = r.winning_numbers ? r.winning_numbers.trim() : '';
+            var tokens = raw.split(' ');
+            var nums = [];
+            for (var i = 0; i < tokens.length; i++) {
+                var n = parseInt(tokens[i], 10); if (!isNaN(n)) nums.push(n);
+            }
+            return nums;
+        },
+        top: 6, isDigit: false
+    },
+    millionaire: {
+        url: 'https://data.ny.gov/resource/a4w9-a3tp.json?$limit=100&$order=draw_date+DESC',
+        extract: function(r) {
+            var raw = r.winning_numbers ? r.winning_numbers.trim() : '';
+            var tokens = raw.split(' ');
+            var nums = [];
+            for (var i = 0; i < tokens.length; i++) {
+                var n = parseInt(tokens[i], 10); if (!isNaN(n)) nums.push(n);
+            }
+            return nums;
+        },
+        top: 5, isDigit: false
+    },
+    quickdraw: {
+        url: 'https://data.ny.gov/resource/7sqk-ycpk.json?$limit=50&$order=draw_date+DESC',
+        extract: function(r) {
+            var raw = r.winning_numbers ? r.winning_numbers.trim() : '';
+            var tokens = raw.split(' ');
+            var nums = [];
+            for (var i = 0; i < tokens.length; i++) {
+                var n = parseInt(tokens[i], 10); if (!isNaN(n)) nums.push(n);
+            }
+            return nums;
+        },
+        top: 5, isDigit: false
+    },
+    take5: {
+        url: 'https://data.ny.gov/resource/dg63-4siq.json?$limit=100&$order=draw_date+DESC',
+        extract: function(r) {
+            var raw = (r.evening_winning_numbers || r.midday_winning_numbers || '').trim();
+            var tokens = raw.split(' ');
+            var nums = [];
+            for (var i = 0; i < tokens.length; i++) {
+                var n = parseInt(tokens[i], 10); if (!isNaN(n)) nums.push(n);
+            }
+            return nums;
+        },
+        top: 5, isDigit: false
+    },
+    pick10: {
+        url: 'https://data.ny.gov/resource/bycu-cw7c.json?$limit=50&$order=draw_date+DESC',
+        extract: function(r) {
+            var raw = r.winning_numbers ? r.winning_numbers.trim() : '';
+            var tokens = raw.split(' ');
+            var nums = [];
+            for (var i = 0; i < tokens.length; i++) {
+                var n = parseInt(tokens[i], 10); if (!isNaN(n)) nums.push(n);
+            }
+            return nums;
+        },
+        top: 5, isDigit: false
+    },
+    win4: {
+        url: 'https://data.ny.gov/resource/hj4u-8nyt.json?$limit=100&$order=draw_date+DESC',
+        extract: function(r) {
+            var nums = [];
+            var keys = Object.keys(r);
+            for (var k = 0; k < keys.length; k++) {
+                var key = keys[k];
+                if (key === 'draw_date' || key.charAt(0) === ':') continue;
+                var val = (r[key] || '').toString().replace(/\s/g, '');
+                if (/^\d{3,4}$/.test(val)) {
+                    for (var i = 0; i < val.length; i++) { nums.push(parseInt(val[i], 10)); }
+                }
+            }
+            return nums;
+        },
+        top: 4, isDigit: true
+    },
+    numbers: {
+        url: 'https://data.ny.gov/resource/hsys-3def.json?$limit=100&$order=draw_date+DESC',
+        extract: function(r) {
+            var nums = [];
+            var keys = Object.keys(r);
+            for (var k = 0; k < keys.length; k++) {
+                var key = keys[k];
+                if (key === 'draw_date' || key.charAt(0) === ':') continue;
+                if (key.indexOf('win') !== -1) continue;
+                var val = (r[key] || '').toString().replace(/\s/g, '');
+                if (/^\d{3}$/.test(val)) {
+                    for (var i = 0; i < val.length; i++) { nums.push(parseInt(val[i], 10)); }
+                }
+            }
+            return nums;
+        },
+        top: 3, isDigit: true
+    }
+};
+
+function getTopNumbers(freq, topN) {
+    var arr = [];
+    var keys = Object.keys(freq);
+    for (var i = 0; i < keys.length; i++) {
+        arr.push({ n: parseInt(keys[i], 10), count: freq[keys[i]] });
+    }
+    arr.sort(function(a, b) { return b.count - a.count || a.n - b.n; });
+    return arr.slice(0, topN);
+}
+
+/* Cold Numbers: lowest frequency first — no extra API call, reuses same freq data */
+function getColdNumbers(freq, topN) {
+    var arr = [];
+    var keys = Object.keys(freq);
+    for (var i = 0; i < keys.length; i++) {
+        arr.push({ n: parseInt(keys[i], 10), count: freq[keys[i]] });
+    }
+    arr.sort(function(a, b) { return a.count - b.count || a.n - b.n; });
+    return arr.slice(0, topN);
+}
+
+function renderHotBalls(gameId, topNums, isDigit) {
+    var container = document.getElementById(gameId + '-hot-balls');
+    if (!container) return;
+    if (!topNums || topNums.length === 0) {
+        container.innerHTML = '<div class="winning-error">No data</div>';
+        return;
+    }
+    container.innerHTML = '';
+    for (var i = 0; i < topNums.length; i++) {
+        var item = topNums[i];
+        var wrap = document.createElement('div');
+        wrap.style.cssText = 'position:relative;display:inline-flex;flex-direction:column;align-items:center;gap:3px;';
+        var ball = document.createElement('div');
+        ball.className = 'ball-hot' + (isDigit ? ' ball-hot-zero' : '');
+        ball.textContent = item.n;
+        var rank = document.createElement('div');
+        rank.className = 'ball-hot-rank';
+        rank.textContent = i + 1;
+        ball.appendChild(rank);
+        var cnt = document.createElement('div');
+        cnt.style.cssText = 'font-size:10px;color:var(--muted);font-weight:500;';
+        cnt.textContent = item.count + 'x';
+        wrap.appendChild(ball);
+        wrap.appendChild(cnt);
+        container.appendChild(wrap);
+    }
+}
+
+function renderColdBalls(gameId, coldNums, isDigit) {
+    var container = document.getElementById(gameId + '-cold-balls');
+    if (!container) return;
+    if (!coldNums || coldNums.length === 0) {
+        container.innerHTML = '<div class="winning-error">No data</div>';
+        return;
+    }
+    container.innerHTML = '';
+    for (var i = 0; i < coldNums.length; i++) {
+        var item = coldNums[i];
+        var wrap = document.createElement('div');
+        wrap.style.cssText = 'position:relative;display:inline-flex;flex-direction:column;align-items:center;gap:3px;';
+        var ball = document.createElement('div');
+        ball.className = 'ball-cold' + (isDigit ? ' ball-cold-zero' : '');
+        ball.textContent = item.n;
+        var rank = document.createElement('div');
+        rank.className = 'ball-cold-rank';
+        rank.textContent = i + 1;
+        ball.appendChild(rank);
+        var cnt = document.createElement('div');
+        cnt.style.cssText = 'font-size:10px;color:var(--muted);font-weight:500;';
+        cnt.textContent = item.count + 'x';
+        wrap.appendChild(ball);
+        wrap.appendChild(cnt);
+        container.appendChild(wrap);
+    }
+}
+
+function fetchHotNumbers(gameId) {
+    var cfg = HOT_CFG[gameId];
+    if (!cfg) return;
+    var container     = document.getElementById(gameId + '-hot-balls');
+    var coldContainer = document.getElementById(gameId + '-cold-balls');
+    if (cfg.useOfficialSite) {
+        if (container)     container.innerHTML     = makeOfficialSiteHTML(cfg.officialUrl, cfg.officialLabel);
+        if (coldContainer) coldContainer.innerHTML = makeOfficialSiteHTML(cfg.officialUrl, cfg.officialLabel);
+        return;
+    }
+
+    /* 우선순위 1: localStorage 캐시 */
+    var cachedHot = loadDailyCache(gameId, 'hot');
+    if (cachedHot && cachedHot.top && cachedHot.cold) {
+        renderHotBalls(gameId, cachedHot.top, cfg.isDigit);
+        renderColdBalls(gameId, cachedHot.cold, cfg.isDigit);
+        if (!cachedHot.freq) {
+            hotNumCache[gameId]  = cachedHot.top.map(function(x){ return x.n; });
+            coldNumCache[gameId] = cachedHot.cold.map(function(x){ return x.n; });
+        } else {
+            storeHotColdCache(gameId, cachedHot.freq, cfg.top);
+        }
+        console.log('[Cache] hot localStorage HIT:', gameId);
+        return;
+    }
+
+    if (container)     container.innerHTML     = '<div class="winning-loading"><span class="spin"></span>Loading...</div>';
+    if (coldContainer) coldContainer.innerHTML = '<div class="winning-loading"><span class="spin"></span>Loading...</div>';
+
+    /* 우선순위 2: Firestore */
+    fetchFromFirestore('hotcold', gameId, function(fsData) {
+        if (fsData && fsData.top && fsData.cold) {
+            renderHotBalls(gameId, fsData.top, cfg.isDigit);
+            renderColdBalls(gameId, fsData.cold, cfg.isDigit);
+            hotNumCache[gameId]  = fsData.top.map(function(x){ return x.n; });
+            coldNumCache[gameId] = fsData.cold.map(function(x){ return x.n; });
+            saveDailyCache(gameId, 'hot', { top: fsData.top, cold: fsData.cold });
+            console.log('[Firebase] hot Firestore HIT:', gameId);
+            return;
+        }
+
+        /* 우선순위 3: data.ny.gov 직접 API (fallback) */
+        fetch(cfg.url)
+        .then(function(resp) { return resp.json(); })
+        .then(function(data) {
+            if (!data || data.length === 0) {
+                if (container)     container.innerHTML     = '<div class="winning-error">No data</div>';
+                if (coldContainer) coldContainer.innerHTML = '<div class="winning-error">No data</div>';
+                return;
+            }
+            /* Build frequency map once — reused for both hot and cold */
+            var freq = {};
+            for (var i = 0; i < data.length; i++) {
+                var nums = cfg.extract(data[i]);
+                for (var j = 0; j < nums.length; j++) {
+                    var key = nums[j];
+                    freq[key] = (freq[key] || 0) + 1;
+                }
+            }
+            var top  = getTopNumbers(freq, cfg.top);
+            var cold = getColdNumbers(freq, cfg.top);
+            renderHotBalls(gameId, top, cfg.isDigit);
+            renderColdBalls(gameId, cold, cfg.isDigit);
+            /* 생성 구슬 색상용 캐시 저장 */
+            storeHotColdCache(gameId, freq, cfg.top);
+            /* localStorage 저장 */
+            saveDailyCache(gameId, 'hot', { top: top, cold: cold });
+            /* Firestore 저장 (다음 사용자를 위해) */
+            saveToFirestore('hotcold', gameId, { top: top, cold: cold });
+            console.log('[API] hot API fallback SAVE:', gameId);
+        })
+        .catch(function() {
+            if (container)     container.innerHTML     = '<div class="winning-error">Could not load</div>';
+            if (coldContainer) coldContainer.innerHTML = '<div class="winning-error">Could not load</div>';
+        });
+    }); /* Firestore callback 닫기 */
+}
+
+
+/* 백그라운드 핫/콜드 프리로드 — DOM 업데이트 없이 캐시만 저장 */
+function fetchHotNumbersBackground(gameId) {
+    var cfg = HOT_CFG[gameId];
+    if (!cfg || cfg.useOfficialSite) return;
+    if (loadDailyCache(gameId, 'hot')) return; /* 이미 캐시 있으면 스킵 */
+    fetch(cfg.url)
+        .then(function(resp) { return resp.json(); })
+        .then(function(data) {
+            if (!data || data.length === 0) return;
+            var freq = {};
+            for (var i = 0; i < data.length; i++) {
+                var nums = cfg.extract(data[i]);
+                for (var j = 0; j < nums.length; j++) {
+                    var key = nums[j];
+                    freq[key] = (freq[key] || 0) + 1;
+                }
+            }
+            var top  = getTopNumbers(freq, cfg.top);
+            var cold = getColdNumbers(freq, cfg.top);
+            storeHotColdCache(gameId, freq, cfg.top);
+            saveDailyCache(gameId, 'hot', { top: top, cold: cold });
+            console.log('[Cache] 백그라운드 hot 저장:', gameId);
+        })
+        .catch(function(){});
+}
+
+/* ══ [Phase 1.4] NAVIGATION with History API (Android back button fix) ══ */
+function goHome() {
+    document.getElementById('game-screen').classList.remove('active');
+    document.getElementById('saved-screen').classList.remove('active');
+    document.getElementById('privacy-screen').classList.remove('active');
+    document.getElementById('terms-screen').classList.remove('active');
+    document.getElementById('home-screen').classList.add('active');
+    window.scrollTo(0, 0);
+}
+
+/* [Phase 2] Privacy Policy screen */
+function openPrivacy() {
+    document.getElementById('home-screen').classList.remove('active');
+    document.getElementById('game-screen').classList.remove('active');
+    document.getElementById('saved-screen').classList.remove('active');
+    document.getElementById('terms-screen').classList.remove('active');
+    document.getElementById('privacy-screen').classList.add('active');
+    window.scrollTo(0, 0);
+    window.history.pushState({ screen: 'privacy' }, '', '#privacy');
+}
+
+/* [Phase 2] Terms of Service screen */
+function openTerms() {
+    document.getElementById('home-screen').classList.remove('active');
+    document.getElementById('game-screen').classList.remove('active');
+    document.getElementById('saved-screen').classList.remove('active');
+    document.getElementById('privacy-screen').classList.remove('active');
+    document.getElementById('terms-screen').classList.add('active');
+    window.scrollTo(0, 0);
+    window.history.pushState({ screen: 'terms' }, '', '#terms');
+}
+
+function openGame(gameId) {
+    document.getElementById('home-screen').classList.remove('active');
+    document.getElementById('saved-screen').classList.remove('active');
+    document.getElementById('game-screen').classList.add('active');
+    switchTab(gameId);
+    window.scrollTo(0, 0);
+    /* [Phase 1.4] push state so Android back button returns to previous screen */
+    window.history.pushState({ screen: 'game', gameId: gameId }, '', '#game-' + gameId);
+}
+
+function switchTab(gameId) {
+    var tabs  = document.querySelectorAll('.tab-btn');
+    var cards = document.querySelectorAll('.game-card');
+    for (var i = 0; i < tabs.length; i++)  tabs[i].classList.remove('active');
+    for (var i = 0; i < cards.length; i++) cards[i].classList.remove('active');
+    for (var i = 0; i < tabs.length; i++) {
+        if (tabs[i].getAttribute('data-game') === gameId) {
+            tabs[i].classList.add('active');
+            tabs[i].scrollIntoView({ behavior:'smooth', block:'nearest', inline:'center' });
+            break;
+        }
+    }
+    var card = document.getElementById(gameId + '-card');
+    if (card) card.classList.add('active');
+    var txt = document.getElementById('topbar-draw-text');
+    if (txt) txt.innerHTML = '<strong>' + getNextDraw(gameId) + '</strong>';
+    /* fetch winning numbers + hot numbers once per session (unless cache expired) */
+    var cached = getCachedWinning(gameId);
+    if (!cached) {
+        fetchedGames[gameId] = false; /* force re-fetch if cache expired */
+    }
+    if (!fetchedGames[gameId]) {
+        fetchedGames[gameId] = true;
+        fetchWinningNumbers(gameId);
+    }
+    if (!fetchedHot[gameId]) {
+        fetchedHot[gameId] = true;
+        fetchHotNumbers(gameId);
+    }
+}
+
+var tabButtons = document.querySelectorAll('.tab-btn');
+for (var t = 0; t < tabButtons.length; t++) {
+    tabButtons[t].addEventListener('click', function() { switchTab(this.getAttribute('data-game')); });
+}
+
+/* ══ [Fix] 뒤로가기 전략 — PWA 앱 종료 방지 + 모달 처리 ══
+   전략: sentinel history 유지
+   - 앱 시작 시 sentinel 2개 push
+   - popstate 시 모달 열려있으면 모달만 닫기
+   - home 도달 시 sentinel 재push → 앱 종료 방지
+   - Quick Generate 모달도 history 관리
+══ */
+function _hideAllScreens() {
+    var ids = ['game-screen','saved-screen','privacy-screen','terms-screen'];
+    for (var i = 0; i < ids.length; i++) {
+        document.getElementById(ids[i]).classList.remove('active');
+    }
+}
+
+function _isAnyModalOpen() {
+    var qgOverlay    = document.getElementById('quick-gen-modal-overlay');
+    var confirmOver  = document.getElementById('confirm-overlay');
+    var ageGate      = document.getElementById('age-gate-overlay');
+    if (qgOverlay    && qgOverlay.classList.contains('visible'))   return 'quick-gen';
+    if (confirmOver  && confirmOver.classList.contains('visible')) return 'confirm';
+    if (ageGate      && ageGate.classList.contains('visible'))     return 'age-gate';
+    return null;
+}
+
+function _closeTopModal(modalName) {
+    if (modalName === 'quick-gen') {
+        var el = document.getElementById('quick-gen-modal-overlay');
+        if (el) el.classList.remove('visible');
+    } else if (modalName === 'confirm') {
+        var el = document.getElementById('confirm-overlay');
+        if (el) el.classList.remove('visible');
+    }
+    /* age-gate는 뒤로가기로 닫지 않음 */
+    /* 모달 닫은 후 sentinel 재push */
+    window.history.pushState({ screen: 'modal-closed' }, '', window.location.pathname);
+}
+
+window.addEventListener('popstate', function(e) {
+    /* 1. 모달 열려있으면 모달만 닫기 */
+    var openModal = _isAnyModalOpen();
+    if (openModal) {
+        _closeTopModal(openModal);
+        return;
+    }
+
+    var state = e.state;
+
+    /* 2. 각 화면별 처리 */
+    if (state && state.screen === 'game') {
+        _hideAllScreens();
+        document.getElementById('game-screen').classList.add('active');
+        if (state.gameId) switchTab(state.gameId);
+        window.scrollTo(0, 0);
+    } else if (state && state.screen === 'saved') {
+        _hideAllScreens();
+        document.getElementById('saved-screen').classList.add('active');
+        renderSavedScreen();
+        window.scrollTo(0, 0);
+    } else if (state && state.screen === 'privacy') {
+        _hideAllScreens();
+        document.getElementById('privacy-screen').classList.add('active');
+        window.scrollTo(0, 0);
+    } else if (state && state.screen === 'terms') {
+        _hideAllScreens();
+        document.getElementById('terms-screen').classList.add('active');
+        window.scrollTo(0, 0);
+    } else {
+        /* 3. home 또는 sentinel 도달
+              → 홈 화면 유지 + sentinel 재push (앱 종료 방지) */
+        _hideAllScreens();
+        document.getElementById('home-screen').classList.add('active');
+        window.scrollTo(0, 0);
+        /* sentinel 재push — 다음 뒤로가기도 앱 종료 안 됨 */
+        window.history.pushState({ screen: 'home' }, '', window.location.pathname);
+    }
+});
+
+/* ══ UTILS ══ */
+function getRandomNumbers(min, max, count) {
+    var numbers = [];
+    while (numbers.length < count) {
+        var num = Math.floor(Math.random() * (max - min + 1)) + min;
+        if (numbers.indexOf(num) === -1) numbers.push(num);
+    }
+    return numbers.sort(function(a, b) { return a - b; });
+}
+function getRandomNumber(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+
+/* ══ RENDER GENERATED NUMBERS ══ */
+function displayResults(gameId, sets, bonusClass) {
+    var container = document.getElementById(gameId + '-results');
+    container.innerHTML = '';
+    var bClass = bonusClass || 'ball-bonus';
+    for (var i = 0; i < sets.length; i++) {
+        var set = sets[i];
+        var setDiv = document.createElement('div');
+        setDiv.className = 'result-set';
+        setDiv.style.animationDelay = (i * 0.05) + 's';
+        var label = document.createElement('div');
+        label.className = 'set-label';
+        label.textContent = 'Set ' + (i + 1);
+        setDiv.appendChild(label);
+        var row = document.createElement('div');
+        row.className = 'balls-row';
+        var addedSep = false;
+        for (var j = 0; j < set.length; j++) {
+            var item = set[j];
+            if (item.bonus && !addedSep) {
+                var sep = document.createElement('div');
+                sep.className = 'ball-sep'; sep.textContent = '+';
+                row.appendChild(sep); addedSep = true;
+            }
+            var ball = document.createElement('div');
+            if (item.bonus) {
+                ball.className = 'ball ' + bClass;
+            } else {
+                /* zero(digit) 공도 핫/콜드 색상 체크 — Win4/Numbers 포함 */
+                var ballType = getBallType(gameId, item.number);
+                if (ballType === 'hot')       ball.className = 'ball ball-hot-tint';
+                else if (ballType === 'cold') ball.className = 'ball ball-cold-tint';
+                else if (item.zero)           ball.className = 'ball ball-zero';
+                else                          ball.className = 'ball ball-main';
+            }
+            ball.textContent = item.number;
+            row.appendChild(ball);
+        }
+        setDiv.appendChild(row);
+        /* Action buttons row */
+        var btnRow = document.createElement('div');
+        btnRow.style.cssText = 'display:flex;align-items:center;flex-wrap:wrap;';
+        /* Save button */
+        var saveBtn = document.createElement('button');
+        saveBtn.className = 'save-btn';
+        saveBtn.innerHTML = '&#11088; Save';
+        (function(gId, s, btn) {
+            btn.addEventListener('click', function() {
+                saveNumbers(gId, s);
+                btn.className = 'save-btn saved';
+                btn.innerHTML = '&#9989; Saved!';
+            });
+        })(gameId, set, saveBtn);
+        btnRow.appendChild(saveBtn);
+        /* Share button */
+        var shareBtn = document.createElement('button');
+        shareBtn.className = 'share-btn';
+        shareBtn.innerHTML = '&#128257; Share';
+        (function(gId, s, btn) {
+            btn.addEventListener('click', function() { shareSet(gId, s, btn); });
+        })(gameId, set, shareBtn);
+        btnRow.appendChild(shareBtn);
+        setDiv.appendChild(btnRow);
+        container.appendChild(setDiv);
+    }
+}
+
+/* ══ SHARE ══ */
+var GAME_EMOJI = {
+    powerball:'⚡', mega:'✨', lotto:'🎱', millionaire:'💎',
+    quickdraw:'🎰', take5:'🎯', pick10:'🔟', win4:'4️⃣', numbers:'🔢'
+};
+
+function formatSetText(gameId, set) {
+    var gameName = GAME_LABELS[gameId] || gameId;
+    var emoji    = GAME_EMOJI[gameId]  || '🎲';
+    var mainNums = [];
+    var bonusNum = null;
+    for (var i = 0; i < set.length; i++) {
+        if (set[i].bonus) bonusNum = set[i].number;
+        else mainNums.push(set[i].number);
+    }
+    var line = mainNums.join('  ');
+    if (bonusNum !== null) line += '  +  ' + bonusNum;
+    return emoji + ' ' + gameName + '\n'
+         + line + '\n'
+         + '⭐ Generated with PickStar';
+}
+
+function showToast(msg) {
+    var old = document.getElementById('lp-toast');
+    if (old) old.parentNode.removeChild(old);
+    var t = document.createElement('div');
+    t.id = 'lp-toast';
+    t.className = 'toast';
+    t.textContent = msg;
+    document.body.appendChild(t);
+    setTimeout(function() {
+        if (t.parentNode) t.parentNode.removeChild(t);
+    }, 2200);
+}
+
+function shareSet(gameId, set, btn) {
+    var text = formatSetText(gameId, set);
+    if (navigator.share) {
+        navigator.share({ title: 'My PickStar Numbers', text: text }).catch(function() {});
+        return;
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(function() {
+            btn.className = 'share-btn copied';
+            btn.innerHTML = '&#9989; Copied!';
+            showToast('📋 Copied to clipboard!');
+            setTimeout(function() {
+                btn.className = 'share-btn';
+                btn.innerHTML = '&#128257; Share';
+            }, 2000);
+        }).catch(function() { showToast('Could not copy — try manually'); });
+        return;
+    }
+    try {
+        var ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.cssText = 'position:fixed;left:-9999px;top:-9999px;';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        btn.className = 'share-btn copied';
+        btn.innerHTML = '&#9989; Copied!';
+        showToast('📋 Copied to clipboard!');
+        setTimeout(function() {
+            btn.className = 'share-btn';
+            btn.innerHTML = '&#128257; Share';
+        }, 2000);
+    } catch(e) {
+        showToast('Copy not supported — select text manually');
+    }
+}
+
+/* ══ GENERATORS ══ */
+function generatePowerball() {
+    if (navigator && navigator.vibrate) { navigator.vibrate(30); }
+    var sets = [];
+    for (var i = 0; i < 5; i++) {
+        var main = getRandomNumbers(1,69,5); var pb = getRandomNumber(1,26); var set = [];
+        for (var j = 0; j < main.length; j++) set.push({number:main[j],bonus:false});
+        set.push({number:pb,bonus:true}); sets.push(set);
+    }
+    displayResults('powerball', sets, 'ball-bonus');
+}
+function generateMega() {
+    if (navigator && navigator.vibrate) { navigator.vibrate(30); }
+    var sets = [];
+    for (var i = 0; i < 5; i++) {
+        var main = getRandomNumbers(1,70,5); var mb = getRandomNumber(1,25); var set = [];
+        for (var j = 0; j < main.length; j++) set.push({number:main[j],bonus:false});
+        set.push({number:mb,bonus:true}); sets.push(set);
+    }
+    displayResults('mega', sets, 'ball-bonus-gold');
+}
+function generateLotto() {
+    if (navigator && navigator.vibrate) { navigator.vibrate(30); }
+    var sets = [];
+    for (var i = 0; i < 5; i++) {
+        var main = getRandomNumbers(1,59,6); var bb = getRandomNumber(1,59); var set = [];
+        for (var j = 0; j < main.length; j++) set.push({number:main[j],bonus:false});
+        set.push({number:bb,bonus:true}); sets.push(set);
+    }
+    displayResults('lotto', sets, 'ball-bonus-green');
+}
+function generateMillionaire() {
+    if (navigator && navigator.vibrate) { navigator.vibrate(30); }
+    var sets = [];
+    for (var i = 0; i < 5; i++) {
+        var main = getRandomNumbers(1,58,5); var mb = getRandomNumber(1,5); var set = [];
+        for (var j = 0; j < main.length; j++) set.push({number:main[j],bonus:false});
+        set.push({number:mb,bonus:true}); sets.push(set);
+    }
+    displayResults('millionaire', sets, 'ball-bonus-gold');
+}
+function generateQuickDraw() {
+    if (navigator && navigator.vibrate) { navigator.vibrate(30); }
+    var sets = [];
+    for (var i = 0; i < 5; i++) {
+        var nums = getRandomNumbers(1,80,10); var set = [];
+        for (var j = 0; j < nums.length; j++) set.push({number:nums[j],bonus:false});
+        sets.push(set);
+    }
+    displayResults('quickdraw', sets);
+}
+function generateTake5() {
+    if (navigator && navigator.vibrate) { navigator.vibrate(30); }
+    var sets = [];
+    for (var i = 0; i < 5; i++) {
+        var nums = getRandomNumbers(1,39,5); var set = [];
+        for (var j = 0; j < nums.length; j++) set.push({number:nums[j],bonus:false});
+        sets.push(set);
+    }
+    displayResults('take5', sets);
+}
+function generatePick10() {
+    if (navigator && navigator.vibrate) { navigator.vibrate(30); }
+    var sets = [];
+    for (var i = 0; i < 5; i++) {
+        var nums = getRandomNumbers(1,80,10); var set = [];
+        for (var j = 0; j < nums.length; j++) set.push({number:nums[j],bonus:false});
+        sets.push(set);
+    }
+    displayResults('pick10', sets);
+}
+function generateWin4() {
+    if (navigator && navigator.vibrate) { navigator.vibrate(30); }
+    var sets = [];
+    for (var i = 0; i < 5; i++) {
+        var set = [];
+        for (var k = 0; k < 4; k++) set.push({number:getRandomNumber(0,9),bonus:false,zero:true});
+        sets.push(set);
+    }
+    displayResults('win4', sets);
+}
+function generateNumbers() {
+    if (navigator && navigator.vibrate) { navigator.vibrate(30); }
+    var sets = [];
+    for (var i = 0; i < 5; i++) {
+        var set = [];
+        for (var k = 0; k < 3; k++) set.push({number:getRandomNumber(0,9),bonus:false,zero:true});
+        sets.push(set);
+    }
+    displayResults('numbers', sets);
+}
+
+/* ══ MY NUMBERS — STORAGE ══ */
+var GAME_LABELS = {
+    powerball:'Powerball', mega:'Mega Millions', lotto:'NY Lotto',
+    millionaire:'Millionaire for Life', quickdraw:'Quick Draw',
+    take5:'Take 5', pick10:'Pick 10', win4:'Win 4', numbers:'Numbers'
+};
+
+/* ══ [Phase 1.3] Safe localStorage wrappers ══
+   Handles Safari private mode and quota-exceeded errors gracefully.
+   Falls back to in-memory storage so app stays functional. */
+var _memStorage = {};
+
+function safeGetItem(key) {
+    try {
+        return localStorage.getItem(key);
+    } catch(e) {
+        console.log('[Storage] Read failed, using memory fallback');
+        return _memStorage[key] !== undefined ? _memStorage[key] : null;
+    }
+}
+
+function safeSetItem(key, value) {
+    try {
+        localStorage.setItem(key, value);
+        return true;
+    } catch(e) {
+        console.log('[Storage] Write failed (private mode / quota?), using memory fallback');
+        _memStorage[key] = value;
+        return false;
+    }
+}
+
+function safeRemoveItem(key) {
+    try {
+        localStorage.removeItem(key);
+        return true;
+    } catch(e) {
+        console.log('[Storage] Remove failed, clearing memory fallback');
+        delete _memStorage[key];
+        return false;
+    }
+}
+
+
+/* ══ 날짜 기반 localStorage 캐시 ══
+   ET 날짜 기준으로 하루 1회만 API 호출.
+   키 형식: ps_cache_YYYY-MM-DD_gameId_type
+   type: 'winning' | 'hot'
+   앱 시작 시 어제 캐시 자동 삭제.
+══ */
+function getTodayKeyET() {
+    var et = getETTime();
+    var y = et.getFullYear();
+    var m = et.getMonth() + 1;
+    var d = et.getDate();
+    return y + '-' + (m < 10 ? '0' : '') + m + '-' + (d < 10 ? '0' : '') + d;
+}
+
+function getDailyCacheKey(gameId, type) {
+    return 'ps_cache_' + getTodayKeyET() + '_' + gameId + '_' + type;
+}
+
+function saveDailyCache(gameId, type, data) {
+    try {
+        safeSetItem(getDailyCacheKey(gameId, type), JSON.stringify(data));
+        return true;
+    } catch(e) { return false; }
+}
+
+function loadDailyCache(gameId, type) {
+    try {
+        var raw = safeGetItem(getDailyCacheKey(gameId, type));
+        return raw ? JSON.parse(raw) : null;
+    } catch(e) { return null; }
+}
+
+function clearOldDailyCache() {
+    var today = getTodayKeyET();
+    try {
+        var keys = [];
+        for (var i = 0; i < localStorage.length; i++) {
+            var k = localStorage.key(i);
+            if (k && k.indexOf('ps_cache_') === 0 && k.indexOf(today) === -1) {
+                keys.push(k);
+            }
+        }
+        for (var j = 0; j < keys.length; j++) { safeRemoveItem(keys[j]); }
+        if (keys.length > 0) console.log('[Cache] 구 캐시 삭제:', keys.length + '개');
+    } catch(e) {}
+}
+
+function getSavedNumbers() {
+    try {
+        var raw = safeGetItem('luckyPick_saved');
+        return raw ? JSON.parse(raw) : [];
+    } catch(e) { return []; }
+}
+
+function setSavedNumbers(arr) {
+    var ok = safeSetItem('luckyPick_saved', JSON.stringify(arr));
+    if (!ok) showToast('⚠️ Saved in memory only (private mode)');
+}
+
+function saveNumbers(gameId, set) {
+    var arr = getSavedNumbers();
+    var now = new Date();
+    var months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    var dateStr = months[now.getMonth()] + ' ' + now.getDate() + ', ' + now.getFullYear()
+                + ' ' + formatTime12(now);
+    arr.unshift({ id: now.getTime(), gameId: gameId, date: dateStr, set: set });
+    if (arr.length > 50) arr = arr.slice(0, 50);
+    setSavedNumbers(arr);
+    updateSavedCountBadges();
+}
+
+function deleteSaved(id) {
+    var arr = getSavedNumbers().filter(function(e){ return e.id !== id; });
+    setSavedNumbers(arr);
+    updateSavedCountBadges();
+    renderSavedScreen();
+}
+
+/* [Phase 1.3] clearAllSaved uses custom modal instead of window.confirm */
+function clearAllSaved() {
+    var overlay = document.getElementById('confirm-overlay');
+    if (overlay) {
+        overlay.classList.add('visible');
+        window.history.pushState({ screen: 'modal', modal: 'confirm' }, '', window.location.pathname);
+    }
+}
+
+function formatTime12(d) {
+    var h = d.getHours(), m = d.getMinutes();
+    var ampm = h >= 12 ? 'PM' : 'AM';
+    return (h%12||12) + ':' + (m<10?'0':'')+m + ' ' + ampm;
+}
+
+function updateSavedCountBadges() {
+    var count = getSavedNumbers().length;
+    var badges = [
+        document.getElementById('home-saved-count'),
+        document.getElementById('saved-count-badge')
+    ];
+    for (var i = 0; i < badges.length; i++) {
+        if (!badges[i]) continue;
+        if (count > 0) {
+            badges[i].textContent = count;
+            badges[i].style.display = 'inline-flex';
+        } else {
+            badges[i].style.display = 'none';
+        }
+    }
+    var clearBtn = document.getElementById('clear-all-btn');
+    if (clearBtn) clearBtn.style.display = count > 0 ? 'inline-flex' : 'none';
+}
+
+/* ══ COMPARE SAVED SET vs WINNING ══ */
+function compareSet(savedSet, winningBalls) {
+    var savedMain  = [];
+    var savedBonus = null;
+    for (var i = 0; i < savedSet.length; i++) {
+        if (savedSet[i].bonus) savedBonus = savedSet[i].number;
+        else savedMain.push(savedSet[i].number);
+    }
+    var winMain  = [];
+    var winBonus = null;
+    for (var i = 0; i < winningBalls.length; i++) {
+        if (winningBalls[i].bonus) winBonus = parseInt(winningBalls[i].n, 10);
+        else winMain.push(parseInt(winningBalls[i].n, 10));
+    }
+    var mainMatches = 0;
+    var matchedNums = [];
+    for (var i = 0; i < savedMain.length; i++) {
+        if (winMain.indexOf(savedMain[i]) !== -1) { mainMatches++; matchedNums.push(savedMain[i]); }
+    }
+    var bonusMatch = (savedBonus !== null && winBonus !== null && savedBonus === winBonus);
+    if (bonusMatch) matchedNums.push(savedBonus);
+    return { mainMatches: mainMatches, bonusMatch: bonusMatch, matchedNums: matchedNums,
+             total: mainMatches + (bonusMatch ? 1 : 0) };
+}
+
+function matchLabel(result, gameId) {
+    var t = result.total;
+    if (t === 0) return { cls:'match-0', text:'No matches' };
+    if (result.bonusMatch && result.mainMatches === 0) return { cls:'match-1', text:'Bonus ball only' };
+    var label = result.mainMatches + ' number' + (result.mainMatches > 1 ? 's' : '') + ' matched';
+    if (result.bonusMatch) label += ' + bonus ball!';
+    if (t <= 2) return { cls:'match-2', text:label };
+    if (t === 3) return { cls:'match-3', text:'🎉 ' + label };
+    return { cls:'match-5', text:'🏆 ' + label + ' — Check ticket!' };
+}
+
+/* ══ RENDER MY NUMBERS SCREEN ══ */
+function renderSavedScreen() {
+    var list = document.getElementById('saved-list');
+    if (!list) return;
+    var arr = getSavedNumbers();
+    list.innerHTML = '';
+
+    if (arr.length === 0) {
+        list.innerHTML = '<div class="saved-empty">'
+            + '<div class="saved-empty-icon">⭐</div>'
+            + '<h3>No saved numbers yet</h3>'
+            + '<p>Generate numbers on any game screen,<br>then tap <strong>⭐ Save this set</strong> to save your picks here.</p>'
+            + '</div>';
+        return;
+    }
+
+    for (var i = 0; i < arr.length; i++) {
+        var entry = arr[i];
+        var card = document.createElement('div');
+        card.className = 'saved-card';
+        var header = document.createElement('div');
+        header.className = 'saved-card-header';
+        var meta = document.createElement('div');
+        meta.className = 'saved-card-meta';
+        var gameTag = document.createElement('span');
+        gameTag.className = 'saved-game-tag';
+        gameTag.textContent = GAME_LABELS[entry.gameId] || entry.gameId;
+        var dateSpan = document.createElement('span');
+        dateSpan.className = 'saved-date';
+        dateSpan.textContent = 'Saved ' + entry.date;
+        meta.appendChild(gameTag);
+        meta.appendChild(dateSpan);
+        var delBtn = document.createElement('button');
+        delBtn.className = 'delete-btn'; delBtn.setAttribute('aria-label', 'Delete saved numbers');
+        delBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4h6v2"/></svg>';
+        delBtn.title = 'Delete this set';
+        (function(eid){ delBtn.addEventListener('click', function(){ deleteSaved(eid); }); })(entry.id);
+        header.appendChild(meta);
+        header.appendChild(delBtn);
+        card.appendChild(header);
+
+        var body = document.createElement('div');
+        body.className = 'saved-card-body';
+        var ballsRow = document.createElement('div');
+        ballsRow.className = 'saved-balls-row';
+
+        /* [Phase 1.5] use getCachedWinning to respect TTL */
+        var winning = getCachedWinning(entry.gameId) || null;
+        var compResult = winning ? compareSet(entry.set, winning) : null;
+
+        var addedSep = false;
+        for (var j = 0; j < entry.set.length; j++) {
+            var item = entry.set[j];
+            if (item.bonus && !addedSep) {
+                var sep = document.createElement('div');
+                sep.className = 'ball-sep'; sep.textContent = '+';
+                ballsRow.appendChild(sep); addedSep = true;
+            }
+            var ball = document.createElement('div');
+            var bClass = item.bonus ? 'ball-w ball-w-bonus' : (item.zero ? 'ball-w ball-w-zero' : 'ball-w ball-w-main');
+            if (compResult && compResult.matchedNums.indexOf(item.number) !== -1) {
+                bClass += ' ball-matched';
+            }
+            ball.className = bClass;
+            ball.textContent = item.number;
+            ballsRow.appendChild(ball);
+        }
+        body.appendChild(ballsRow);
+
+        var matchDiv = document.createElement('div');
+        if (!winning) {
+            matchDiv.className = 'match-loading';
+            matchDiv.textContent = 'Loading latest results for comparison…';
+        } else {
+            var ml = matchLabel(compResult, entry.gameId);
+            matchDiv.className = 'match-result ' + ml.cls;
+            matchDiv.innerHTML = ml.text;
+        }
+        body.appendChild(matchDiv);
+        card.appendChild(body);
+        list.appendChild(card);
+    }
+}
+
+/* ══ NAVIGATION — MY NUMBERS ══ */
+function openSaved() {
+    document.getElementById('home-screen').classList.remove('active');
+    document.getElementById('game-screen').classList.remove('active');
+    document.getElementById('saved-screen').classList.add('active');
+    window.scrollTo(0, 0);
+    /* [Phase 1.4] push state for back button */
+    window.history.pushState({ screen: 'saved' }, '', '#saved');
+    renderSavedScreen();
+    var arr = getSavedNumbers();
+    var seenGames = {};
+    for (var i = 0; i < arr.length; i++) {
+        var gId = arr[i].gameId;
+        if (!seenGames[gId]) {
+            seenGames[gId] = true;
+            /* [Phase 1.5] only fetch if cache is empty or expired */
+            if (!getCachedWinning(gId) && API_CFG[gId] && !API_CFG[gId].useOfficialSite) {
+                fetchWinningNumbersForCompare(gId);
+            }
+        }
+    }
+}
+
+/* Lean fetch just for comparison (doesn't touch DOM winning balls/date) */
+function fetchWinningNumbersForCompare(gameId) {
+    var cfg = API_CFG[gameId];
+    if (!cfg || cfg.useOfficialSite) return;
+    fetch(cfg.url)
+        .then(function(resp) { return resp.json(); })
+        .then(function(data) {
+            if (!data || data.length === 0) return;
+            var parsed = cfg.parse(data[0]);
+            /* [Phase 1.5] cache with TTL */
+            cacheWinning(gameId, parsed.balls);
+            if (document.getElementById('saved-screen').classList.contains('active')) {
+                renderSavedScreen();
+            }
+        })
+        .catch(function(){});
+}
+
+/* ══ INIT ══ */
+window.addEventListener('load', function() {
+    /* [Fix] PWA 앱 종료 방지 sentinel history 초기화
+       sentinel 2개를 미리 push해서
+       뒤로가기를 2번 눌러도 앱이 닫히지 않음 */
+    window.history.replaceState({ screen: 'sentinel' }, '', window.location.pathname);
+    window.history.pushState({ screen: 'home' }, '', window.location.pathname);
+
+    /* ══ PickStar: 별 반짝임 애니메이션 ══
+       - 100개의 별을 JS로 동적 생성 (CSS keyframes 재사용)
+       - 각 별: 위치/크기/밝기/속도 랜덤
+       - 유성(shooting star) 15~30초마다 랜덤 등장
+       - prefers-reduced-motion 존중
+    ══ */
+    (function() {
+        var canvas = document.getElementById('star-canvas');
+        if (!canvas) return;
+        var STAR_COUNT = 110;
+        var reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+        /* 별 생성 */
+        for (var i = 0; i < STAR_COUNT; i++) {
+            var star = document.createElement('div');
+            star.className = 'star';
+            var size     = (Math.random() * 1.8 + 0.6).toFixed(2);  /* 0.6~2.4px */
+            var x        = (Math.random() * 100).toFixed(2);
+            var y        = (Math.random() * 100).toFixed(2);
+            var dur      = (Math.random() * 3 + 2).toFixed(2);       /* 2~5s */
+            var delay    = (Math.random() * 6).toFixed(2);           /* 0~6s */
+            var minOp    = (Math.random() * 0.15 + 0.05).toFixed(2); /* 0.05~0.2 */
+            var maxOp    = (Math.random() * 0.5 + 0.35).toFixed(2);  /* 0.35~0.85 */
+            star.style.cssText = [
+                'width:'    + size + 'px',
+                'height:'   + size + 'px',
+                'left:'     + x + '%',
+                'top:'      + y + '%',
+                '--s-min:'  + minOp,
+                '--s-max:'  + maxOp,
+                'animation-duration:'        + dur + 's',
+                'animation-delay:-'          + delay + 's',
+                'opacity:'  + minOp,
+            ].join(';');
+            /* 밝은 별 일부는 glow 효과 */
+            if (Math.random() > 0.75) {
+                star.style.boxShadow = '0 0 ' + (parseFloat(size)*2) + 'px rgba(255,255,255,0.6)';
+            }
+            canvas.appendChild(star);
+        }
+
+        /* 유성 생성 함수 */
+        function launchShootingStar() {
+            if (reduced) return;
+            var s = document.createElement('div');
+            s.className = 'shooting-star';
+            var startX = (Math.random() * 70 + 5).toFixed(1);
+            var startY = (Math.random() * 40 + 5).toFixed(1);
+            var dur    = (Math.random() * 0.8 + 0.6).toFixed(2);  /* 0.6~1.4s */
+            s.style.cssText = 'left:' + startX + '%;top:' + startY + '%;animation-duration:' + dur + 's;';
+            canvas.appendChild(s);
+            setTimeout(function() {
+                if (s.parentNode) s.parentNode.removeChild(s);
+            }, parseFloat(dur) * 1000 + 100);
+        }
+
+        /* 유성: 처음 1.5초 뒤 첫 등장, 이후 15~30초마다 */
+        if (!reduced) {
+            setTimeout(function() {
+                launchShootingStar();
+                setInterval(function() {
+                    launchShootingStar();
+                }, Math.random() * 15000 + 15000);
+            }, 1500);
+        }
+    })();
+
+    /* [Phase 2] Age Gate initialization — runs before anything else */
+    var ageGateOverlay = document.getElementById('age-gate-overlay');
+    var ageBlocked     = document.getElementById('age-blocked');
+    var ageYesBtn      = document.getElementById('age-gate-yes-btn');
+    var ageNoBtn       = document.getElementById('age-gate-no-btn');
+
+    if (!safeGetItem('lp_age_verified')) {
+        if (ageGateOverlay) ageGateOverlay.classList.add('visible');
+    }
+    if (ageYesBtn) {
+        ageYesBtn.addEventListener('click', function() {
+            safeSetItem('lp_age_verified', '1');
+            if (ageGateOverlay) ageGateOverlay.classList.remove('visible');
+        });
+    }
+    if (ageNoBtn) {
+        ageNoBtn.addEventListener('click', function() {
+            if (ageGateOverlay) ageGateOverlay.classList.remove('visible');
+            if (ageBlocked) ageBlocked.classList.add('visible');
+        });
+    }
+
+    /* [캐시] 구 날짜 캐시 삭제 */
+    clearOldDailyCache();
+
+    updateClock();
+    updateNextDraws();
+    updateSavedCountBadges();
+    setInterval(updateClock, 1000);
+    setInterval(updateNextDraws, 60000);
+
+    /* [캐시] 앱 시작 시 백그라운드 프리로드
+       — 9개 게임 데이터를 미리 가져와 캐시에 저장
+       — 사용자가 탭 클릭 시 즉시 표시 가능 */
+    setTimeout(function() {
+        var PRELOAD_GAMES = ['powerball','mega','lotto','millionaire','take5','pick10','win4','numbers','quickdraw'];
+        var idx = 0;
+        function preloadNext() {
+            if (idx >= PRELOAD_GAMES.length) {
+                console.log('[Cache] 프리로드 완료');
+                return;
+            }
+            var gId = PRELOAD_GAMES[idx++];
+            /* 이미 캐시 있으면 스킵 */
+            var wCached = loadDailyCache(gId, 'winning');
+            var hCached = loadDailyCache(gId, 'hot');
+            if (!wCached) fetchWinningNumbersForCompare(gId);
+            if (!hCached) fetchHotNumbersBackground(gId);
+            /* 1.5초 간격으로 순차 호출 (서버 부하 분산) */
+            setTimeout(preloadNext, 1500);
+        }
+        preloadNext();
+    }, 2000); /* 앱 UI 로드 후 2초 뒤 시작 */
+
+    /* [Phase 1.3] Custom confirm modal wiring */
+    var confirmOverlay = document.getElementById('confirm-overlay');
+    var confirmOkBtn   = document.getElementById('confirm-ok-btn');
+    var confirmCancel  = document.getElementById('confirm-cancel-btn');
+
+    if (confirmOkBtn) {
+        confirmOkBtn.addEventListener('click', function() {
+            setSavedNumbers([]);
+            updateSavedCountBadges();
+            renderSavedScreen();
+            if (confirmOverlay) confirmOverlay.classList.remove('visible');
+            showToast('🗑️ All numbers cleared');
+        });
+    }
+    if (confirmCancel) {
+        confirmCancel.addEventListener('click', function() {
+            if (confirmOverlay) confirmOverlay.classList.remove('visible');
+        });
+    }
+    /* Close modal on overlay background tap */
+    if (confirmOverlay) {
+        confirmOverlay.addEventListener('click', function(e) {
+            if (e.target === confirmOverlay) confirmOverlay.classList.remove('visible');
+        });
+    }
+
+
+    /* ══ QUICK GENERATE ══ */
+    var _quickGenResults = null;
+
+    function quickGenerateAll() {
+        var results = [];
+        var GAME_CONFIGS = [
+            { id:'powerball',   label:'Powerball',           fn: function() {
+                var m = getRandomNumbers(1,69,5); var b = getRandomNumber(1,26);
+                var set = []; for(var i=0;i<m.length;i++) set.push({number:m[i],bonus:false});
+                set.push({number:b,bonus:true}); return set; }, bonusClass:'ball-bonus' },
+            { id:'mega',        label:'Mega Millions',       fn: function() {
+                var m = getRandomNumbers(1,70,5); var b = getRandomNumber(1,25);
+                var set = []; for(var i=0;i<m.length;i++) set.push({number:m[i],bonus:false});
+                set.push({number:b,bonus:true}); return set; }, bonusClass:'ball-bonus' },
+            { id:'lotto',       label:'NY Lotto',            fn: function() {
+                var m = getRandomNumbers(1,59,6); var b = getRandomNumber(1,59);
+                var set = []; for(var i=0;i<m.length;i++) set.push({number:m[i],bonus:false});
+                set.push({number:b,bonus:true}); return set; }, bonusClass:'ball-bonus' },
+            { id:'millionaire', label:'Millionaire for Life',fn: function() {
+                var m = getRandomNumbers(1,58,5); var b = getRandomNumber(1,5);
+                var set = []; for(var i=0;i<m.length;i++) set.push({number:m[i],bonus:false});
+                set.push({number:b,bonus:true}); return set; }, bonusClass:'ball-bonus' },
+            { id:'quickdraw',   label:'Quick Draw',          fn: function() {
+                var m = getRandomNumbers(1,80,10);
+                var set = []; for(var i=0;i<m.length;i++) set.push({number:m[i],bonus:false});
+                return set; }, bonusClass:'' },
+            { id:'take5',       label:'Take 5',              fn: function() {
+                var m = getRandomNumbers(1,39,5);
+                var set = []; for(var i=0;i<m.length;i++) set.push({number:m[i],bonus:false});
+                return set; }, bonusClass:'' },
+            { id:'pick10',      label:'Pick 10',             fn: function() {
+                var m = getRandomNumbers(1,80,10);
+                var set = []; for(var i=0;i<m.length;i++) set.push({number:m[i],bonus:false});
+                return set; }, bonusClass:'' },
+            { id:'win4',        label:'Win 4',               fn: function() {
+                var set = []; for(var k=0;k<4;k++) set.push({number:getRandomNumber(0,9),bonus:false,zero:true});
+                return set; }, bonusClass:'' },
+            { id:'numbers',     label:'Numbers',             fn: function() {
+                var set = []; for(var k=0;k<3;k++) set.push({number:getRandomNumber(0,9),bonus:false,zero:true});
+                return set; }, bonusClass:'' },
+        ];
+        for (var i = 0; i < GAME_CONFIGS.length; i++) {
+            var cfg = GAME_CONFIGS[i];
+            results.push({ id: cfg.id, label: cfg.label, set: cfg.fn(), bonusClass: cfg.bonusClass });
+        }
+        return results;
+    }
+
+    function buildQGBalls(set, bonusClass, gameId) {
+        var row = document.createElement('div');
+        row.className = 'qg-balls-row';
+        var addedSep = false;
+        for (var i = 0; i < set.length; i++) {
+            var item = set[i];
+            if (item.bonus && !addedSep) {
+                var sep = document.createElement('div');
+                sep.className = 'ball-sep'; sep.textContent = '+';
+                row.appendChild(sep); addedSep = true;
+            }
+            var ball = document.createElement('div');
+            ball.style.cssText = 'width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:11px;flex:none;flex-shrink:0;';
+            if (item.bonus) {
+                ball.style.background = 'linear-gradient(145deg,#78350f,#b45309)';
+                ball.style.color = '#fde68a';
+                ball.style.border = '1px solid rgba(212,168,67,0.4)';
+            } else if (item.zero) {
+                ball.style.background = 'linear-gradient(145deg,#1f2937,#374151)';
+                ball.style.color = '#d1d5db';
+                ball.style.border = '1px solid rgba(255,255,255,0.12)';
+            } else {
+                /* zero(digit) 공도 핫/콜드 체크 — Win4/Numbers 포함 */
+                var bType = getBallType(gameId, item.number);
+                if (bType === 'hot') {
+                    ball.style.background = 'linear-gradient(145deg,#7f1d1d,#b91c1c)';
+                    ball.style.color = '#fca5a5';
+                    ball.style.border = '1px solid rgba(239,68,68,0.4)';
+                } else if (bType === 'cold') {
+                    ball.style.background = 'linear-gradient(145deg,#1e3a5f,#1d4ed8)';
+                    ball.style.color = '#bfdbfe';
+                    ball.style.border = '1px solid rgba(96,165,250,0.45)';
+                } else if (item.zero) {
+                    ball.style.background = 'linear-gradient(145deg,#1f2937,#374151)';
+                    ball.style.color = '#d1d5db';
+                    ball.style.border = '1px solid rgba(255,255,255,0.12)';
+                } else {
+                    ball.style.background = 'linear-gradient(145deg,#1f2937,#374151)';
+                    ball.style.color = '#d1d5db';
+                    ball.style.border = '1px solid rgba(255,255,255,0.12)';
+                }
+            }
+            ball.textContent = item.number;
+            row.appendChild(ball);
+        }
+        return row;
+    }
+
+    function openQuickGenModal() {
+        var body = document.getElementById('quick-gen-modal-body');
+        var overlay = document.getElementById('quick-gen-modal-overlay');
+        if (!body || !overlay || !_quickGenResults) return;
+        body.innerHTML = '';
+        for (var i = 0; i < _quickGenResults.length; i++) {
+            var g = _quickGenResults[i];
+            var row = document.createElement('div');
+            row.className = 'qg-game-row';
+            var top = document.createElement('div');
+            top.className = 'qg-game-row-top';
+            var name = document.createElement('span');
+            name.className = 'qg-game-name';
+            name.textContent = g.label;
+            var saveBtn = document.createElement('button');
+            saveBtn.className = 'qg-save-btn';
+            saveBtn.innerHTML = '&#11088; Save';
+            (function(gId, gSet, btn) {
+                btn.addEventListener('click', function() {
+                    saveNumbers(gId, gSet);
+                    btn.className = 'qg-save-btn saved';
+                    btn.innerHTML = '&#9989; Saved!';
+                    showToast('⭐ ' + GAME_LABELS[gId] + ' saved!');
+                });
+            })(g.id, g.set, saveBtn);
+            top.appendChild(name);
+            top.appendChild(saveBtn);
+            var balls = buildQGBalls(g.set, g.bonusClass, g.id);
+            row.appendChild(top);
+            row.appendChild(balls);
+            body.appendChild(row);
+        }
+        overlay.classList.add('visible');
+        if (navigator && navigator.vibrate) { navigator.vibrate(30); }
+        /* 모달 열릴 때 history에 추가 → 뒤로가기로 닫힘 */
+        window.history.pushState({ screen: 'modal', modal: 'quick-gen' }, '', window.location.pathname);
+    }
+
+    function saveFromQuickGen(gameId, set) {
+        saveNumbers(gameId, set);
+    }
+
+    /* 버튼 + 카드 초기화 */
+    var qgBtn      = document.getElementById('quick-gen-btn');
+    var qgCard     = document.getElementById('quick-gen-card');
+    var qgViewBtn  = document.getElementById('quick-gen-view-btn');
+    var qgCardTime = document.getElementById('quick-gen-card-time');
+    var qgOverlay  = document.getElementById('quick-gen-modal-overlay');
+    var qgClose    = document.getElementById('quick-gen-modal-close');
+
+    if (qgBtn) {
+        qgBtn.addEventListener('click', function() {
+            _quickGenResults = quickGenerateAll();
+            /* 카드 표시 */
+            var now = new Date();
+            if (qgCardTime) qgCardTime.textContent = formatTime12(now);
+            if (qgCard) qgCard.classList.add('visible');
+            showToast('⚡ All 9 games generated!');
+            if (navigator && navigator.vibrate) { navigator.vibrate(30); }
+        });
+    }
+    if (qgViewBtn) {
+        qgViewBtn.addEventListener('click', function() { openQuickGenModal(); });
+    }
+    if (qgClose) {
+        qgClose.addEventListener('click', function() {
+            if (qgOverlay) qgOverlay.classList.remove('visible');
+        });
+    }
+    if (qgOverlay) {
+        qgOverlay.addEventListener('click', function(e) {
+            if (e.target === qgOverlay) qgOverlay.classList.remove('visible');
+        });
+    }
+
+    /* ── Phase 3: iOS 홈화면 추가 안내 카드 ── */
+    var iosCard    = document.getElementById('ios-install-card');
+    var iosDismiss = document.getElementById('ios-install-dismiss');
+    var isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+    var isStandalone = window.matchMedia('(display-mode: standalone)').matches
+                    || window.navigator.standalone === true;
+    if (isIOS && !isStandalone && !safeGetItem('lp_ios_dismissed')) {
+        if (iosCard) iosCard.classList.add('visible');
+    }
+    if (iosDismiss) {
+        iosDismiss.addEventListener('click', function() {
+            if (iosCard) iosCard.classList.remove('visible');
+            safeSetItem('lp_ios_dismissed', '1');
+        });
+    }
+
+    /* ── Service Worker registration ── */
+    if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('./service-worker.js')
+            .then(function(reg) {
+                console.log('[SW] Registered. Scope:', reg.scope);
+            })
+            .catch(function(err) {
+                console.log('[SW] Registration failed:', err);
+            });
+    }
+
+    /* ── Offline / Online detection ── */
+    var offlineBanner = document.getElementById('offline-banner');
+    function updateOnlineStatus() {
+        if (!navigator.onLine) {
+            offlineBanner.classList.add('visible');
+        } else {
+            offlineBanner.classList.remove('visible');
+        }
+    }
+    window.addEventListener('online',  updateOnlineStatus);
+    window.addEventListener('offline', updateOnlineStatus);
+    updateOnlineStatus();
+
+    /* ── PWA Install prompt ── */
+    var deferredPrompt = null;
+    var installBanner  = document.getElementById('install-banner');
+    var installBtn     = document.getElementById('install-btn');
+    var installDismiss = document.getElementById('install-dismiss');
+
+    window.addEventListener('beforeinstallprompt', function(e) {
+        e.preventDefault();
+        deferredPrompt = e;
+        /* [Phase 1.3] use safeGetItem */
+        if (!safeGetItem('lp_install_dismissed')) {
+            installBanner.classList.add('visible');
+        }
+    });
+
+    if (installBtn) {
+        installBtn.addEventListener('click', function() {
+            if (!deferredPrompt) return;
+            deferredPrompt.prompt();
+            deferredPrompt.userChoice.then(function(choice) {
+                deferredPrompt = null;
+                installBanner.classList.remove('visible');
+                if (choice.outcome === 'accepted') {
+                    showToast('🎉 PickStar installed!');
+                }
+            });
+        });
+    }
+
+    if (installDismiss) {
+        installDismiss.addEventListener('click', function() {
+            installBanner.classList.remove('visible');
+            /* [Phase 1.3] use safeSetItem */
+            safeSetItem('lp_install_dismissed', '1');
+        });
+    }
+
+    if (window.matchMedia('(display-mode: standalone)').matches) {
+        if (installBanner) installBanner.classList.remove('visible');
+    }
+});
+</script>
+</body>
+</html>
